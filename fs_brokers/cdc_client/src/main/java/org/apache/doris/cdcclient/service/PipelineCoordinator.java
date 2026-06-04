@@ -168,6 +168,7 @@ public class PipelineCoordinator {
                     long elapsedTime = System.currentTimeMillis() - startTime;
                     boolean timeoutReached = elapsedTime > Constants.POLL_SPLIT_RECORDS_TIMEOUTS;
                     if (shouldStop(
+                            sourceReader,
                             isSnapshotSplit,
                             hasReceivedData,
                             lastMessageIsHeartbeat,
@@ -315,6 +316,7 @@ public class PipelineCoordinator {
                     boolean timeoutReached = elapsedTime > Constants.POLL_SPLIT_RECORDS_TIMEOUTS;
 
                     if (shouldStop(
+                            sourceReader,
                             isSnapshotSplit,
                             hasReceivedData,
                             lastMessageIsHeartbeat,
@@ -440,7 +442,11 @@ public class PipelineCoordinator {
         Map<String, String> targetTableMappings =
                 ConfigUtil.parseAllTargetTableMappings(writeRecordRequest.getConfig());
 
-        SourceReader sourceReader = Env.getCurrentEnv().getReader(writeRecordRequest);
+        // Get-or-create the reader and claim ownership atomically, so a concurrent stale
+        // releaseReader RPC cannot stop the reader this task is about to use.
+        SourceReader sourceReader =
+                Env.getCurrentEnv()
+                        .getReaderAndClaim(writeRecordRequest, writeRecordRequest.getTaskId());
         DorisBatchStreamLoad batchStreamLoad = null;
         long scannedRows = 0L;
         int heartbeatCount = 0;
@@ -456,6 +462,8 @@ public class PipelineCoordinator {
             long startTime = System.currentTimeMillis();
             long streamingStartTime = -1;
             long maxIntervalMillis = writeRecordRequest.getMaxInterval() * 1000;
+            // Half the FE task timeout; exit setup phase before FE force-kills. 0 disables.
+            long searchTimeoutMs = writeRecordRequest.getTaskTimeoutMs() / 2;
             boolean shouldStop = false;
             boolean lastMessageIsHeartbeat = false;
 
@@ -473,6 +481,21 @@ public class PipelineCoordinator {
                 if (!recordIterator.hasNext()) {
                     Thread.sleep(100);
 
+                    // Stream-split setup stuck (WAL search / idle): bail out; snapshot has its own
+                    // completion logic.
+                    if (!isSnapshotSplit
+                            && streamingStartTime < 0
+                            && searchTimeoutMs > 0
+                            && System.currentTimeMillis() - startTime > searchTimeoutMs) {
+                        LOG.warn(
+                                "Streaming not started within {} ms for jobId={} taskId={}, "
+                                        + "stopping to commit offset",
+                                searchTimeoutMs,
+                                writeRecordRequest.getJobId(),
+                                writeRecordRequest.getTaskId());
+                        break;
+                    }
+
                     // Check if should stop
                     long elapsedTime =
                             streamingStartTime > 0
@@ -484,6 +507,7 @@ public class PipelineCoordinator {
                                     && elapsedTime >= maxIntervalMillis;
 
                     if (shouldStop(
+                            sourceReader,
                             isSnapshotSplit,
                             scannedRows > 0,
                             lastMessageIsHeartbeat,
@@ -615,6 +639,7 @@ public class PipelineCoordinator {
      * @return true if should stop, false if should continue
      */
     private boolean shouldStop(
+            SourceReader sourceReader,
             boolean isSnapshotSplit,
             boolean hasData,
             boolean lastMessageIsHeartbeat,
@@ -622,11 +647,13 @@ public class PipelineCoordinator {
             long maxIntervalMillis,
             boolean timeoutReached) {
 
-        // 1. Snapshot split with data: if no more data in queue, stop immediately (no need to wait
-        // for timeout)
-        // snapshot split will be written to the debezium queue all at once.
-        // multiple snapshot splits are handled in the source reader.
+        // Snapshot split: wait until every split has received its high-watermark event;
+        // an empty poll alone is not a finish signal under pollWithoutBuffer where the
+        // fetcher returns one ChangeEventQueue batch at a time.
         if (isSnapshotSplit) {
+            if (!sourceReader.isSnapshotFinished()) {
+                return false;
+            }
             LOG.info(
                     "Snapshot split finished, no more data available. Total elapsed: {} ms",
                     elapsedTime);

@@ -186,6 +186,10 @@ public:
         return doris::TabletStorageType::STORAGE_TYPE_REMOTE;
     }
 
+    // Returns true if this scanner's partition has been pruned by a runtime filter.
+    // Overridden by OlapScanner to check partition pruning state.
+    virtual bool check_partition_pruned() const { return false; }
+
     bool need_to_close() const { return _need_to_close; }
 
     void mark_to_need_to_close() {
@@ -240,7 +244,6 @@ protected:
     std::vector<VExprContextSPtrs> _intermediate_projections;
     Block _origin_block;
     Block _padding_block;
-    bool _alreay_eos = false;
 
     VExprContextSPtrs _common_expr_ctxs_push_down;
 

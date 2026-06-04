@@ -194,7 +194,7 @@ Status VectorizedIfExpr::execute_for_null_then_else(Block& block,
         return Status::OK();
     }
 
-    const auto* cond_col = typeid_cast<const ColumnUInt8*>(arg_cond.column.get());
+    const auto* cond_col = check_and_get_column<ColumnUInt8>(arg_cond.column.get());
     const ColumnConst* cond_const_col =
             check_and_get_column_const<ColumnUInt8>(arg_cond.column.get());
 
@@ -589,6 +589,12 @@ void insert_result_data(MutableColumnPtr& result_column, ColumnPtr& argument_col
                     binary_cast<VecDateTimeValue, int64_t>(result_raw_data[row]) +
                     binary_cast<VecDateTimeValue, int64_t>(column_raw_data[row]) *
                             int64_t(!(null_map_data[row] | filled_flag[row])));
+        } else if constexpr (std::is_same_v<ColumnType, ColumnFloat32> ||
+                             std::is_same_v<ColumnType, ColumnFloat64>) {
+            auto flag = (!(null_map_data[row] | filled_flag[row]));
+            result_raw_data[row] += std::isfinite(column_raw_data[row])
+                                            ? column_raw_data[row] * flag
+                                            : (flag ? column_raw_data[row] : 0);
         } else {
             result_raw_data[row] +=
                     column_raw_data[row] *
